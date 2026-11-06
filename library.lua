@@ -18,6 +18,7 @@ local UserInputService = game:GetService("UserInputService")
 local RunService       = game:GetService("RunService")
 local TextService      = game:GetService("TextService")
 local GuiService       = game:GetService("GuiService")
+local HttpService      = game:GetService("HttpService")
 
 local LocalPlayer = Players.LocalPlayer
 local FONT = Enum.Font.Code
@@ -41,6 +42,10 @@ local Library = {
     DragSmoothness = 20,
 
     Registry = {}, Connections = {}, Windows = {}, UnloadCallbacks = {},
+    Ordered = {},                 -- every element in creation order (used by configs)
+    IgnoreFlags = {},             -- flags excluded from configs
+    ConfigFolder = "Kraxx/configs",
+    ConfigTitle = "Kraxx",
     ActivePopup = nil, ActiveDrag = nil, Picking = false, Unloaded = false, NotifyOrder = 0,
 }
 local Theme = Library.Theme
@@ -344,7 +349,11 @@ local function BindLabelWidth(label, holder, left)
     update()
 end
 
-local function Register(flag, obj)
+local function Register(flag, obj, group, parent, cfg)
+    obj.Flag, obj.Group, obj.ParentObj = flag, group, parent
+    obj.Standalone = cfg and cfg.Standalone or nil
+    if cfg and cfg.NoSave and flag then Library.IgnoreFlags[flag] = true end
+    table.insert(Library.Ordered, obj)
     if not flag then return end
     Library.Options[flag] = obj
     if obj.Type == "Toggle" then Library.Toggles[flag] = obj end
@@ -446,7 +455,7 @@ local function CreateKeybind(parentObj, flag, cfg)
     end
 
     if flag then Library.Flags[flag] = KB.Value end
-    Register(flag, KB)
+    Register(flag, KB, parentObj.Group, parentObj, cfg)
     Render()
     return KB
 end
@@ -459,7 +468,7 @@ local function CreateColorPicker(parentObj, flag, cfg)
     assert(parentObj.AddonHolder, "AddColorPicker: this element cannot hold addons")
 
     local CP = setmetatable({
-        Type = "ColorPicker", Value = cfg.Default or Color3.new(1, 1, 1), Changed = {}, Callback = cfg.Callback,
+        Type = "ColorPicker", Value = cfg.Default or Color3.new(1, 1, 1), Text = cfg.Text, Changed = {}, Callback = cfg.Callback,
     }, ObjectMeta)
     local h, s, v = CP.Value:ToHSV()
     local opened = false
@@ -598,7 +607,7 @@ local function CreateColorPicker(parentObj, flag, cfg)
     end)
 
     Commit(true)
-    Register(flag, CP)
+    Register(flag, CP, parentObj.Group, parentObj, cfg)
     return CP
 end
 
@@ -640,6 +649,7 @@ function Elements:AddLabel(text, wrap)
     if not wrap then BindLabelWidth(TL, Label.AddonHolder, 0) end
 
     function Label:SetText(t) self.Text = t; TL.Text = t end
+    Register(nil, Label, self)
     return Label
 end
 
@@ -647,6 +657,7 @@ end
 function Elements:AddDivider()
     local Row = New("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 5), LayoutOrder = self:_Next(), Parent = self.Container })
     New("Frame", { BackgroundColor3 = Theme.Outline, Position = UDim2.fromOffset(0, 2), Size = UDim2.new(1, 0, 0, 1), Parent = Row })
+    Register(nil, { Type = "Divider" }, self)
 end
 
 -- Button -----------------------------------------------------------------
@@ -746,7 +757,7 @@ function Elements:AddToggle(flag, cfg)
     Render(0)
     -- registry: keep the "on" colour following accent changes
     table.insert(Library.Registry, { Object = Box, Property = "BackgroundColor3", Key = "Accent", When = function() return Toggle.Value end })
-    Register(flag, Toggle)
+    Register(flag, Toggle, self, nil, cfg)
     return Toggle
 end
 
@@ -814,7 +825,7 @@ function Elements:AddSlider(flag, cfg)
     end)
 
     Slider:SetValue(cfg.Default or min, true)
-    Register(flag, Slider)
+    Register(flag, Slider, self, nil, cfg)
     return Slider
 end
 
@@ -994,7 +1005,7 @@ function Elements:AddDropdown(flag, cfg)
         Dropdown:SetValue(default, true)
     end
 
-    Register(flag, Dropdown)
+    Register(flag, Dropdown, self, nil, cfg)
     return Dropdown
 end
 
@@ -1051,7 +1062,7 @@ function Elements:AddInput(flag, cfg)
     if not cfg.Finished then TB:GetPropertyChangedSignal("Text"):Connect(Commit) end
 
     if flag then Library.Flags[flag] = Input.Value end
-    Register(flag, Input)
+    Register(flag, Input, self, nil, cfg)
     return Input
 end
 
@@ -1156,6 +1167,7 @@ end
 function Library:CreateWindow(cfg)
     cfg = cfg or {}
     if cfg.ToggleKey then self.ToggleKey = NormalizeKey(cfg.ToggleKey) end
+    if cfg.ConfigFolder then self.ConfigFolder = cfg.ConfigFolder end
 
     local size = cfg.Size or UDim2.fromOffset(560, 600)
     local start = cfg.Position and Vector2.new(cfg.Position.X.Offset, cfg.Position.Y.Offset) or (Viewport() / 2)
@@ -1308,13 +1320,37 @@ function Library:CreateWindow(cfg)
         function Tab:AddLeftTabbox() self.LeftOrder += 1; return NewTabbox(self.Left, self.LeftOrder) end
         function Tab:AddRightTabbox() self.RightOrder += 1; return NewTabbox(self.Right_, self.RightOrder) end
 
-        table.insert(self.Tabs, Tab)
-        if not self.ActiveTab then self:SelectTab(Tab) else LayoutTabs(false) end
+        local isSettings = self._BuildingSettings == true
+        if self.SettingsTab and not isSettings then
+            table.insert(self.Tabs, #self.Tabs, Tab)   -- settings always stays last
+        else
+            table.insert(self.Tabs, Tab)
+        end
+        if isSettings then self.SettingsTab = Tab end
+
+        if not self.ActiveTab then
+            self:SelectTab(Tab)
+        elseif not isSettings and not self.UserTabSelected then
+            self.UserTabSelected = true
+            self:SelectTab(Tab)
+        else
+            LayoutTabs(false)
+        end
         return Tab
+    end
+
+    if cfg.SettingsTab ~= false then
+        Window._BuildingSettings = true
+        Library:_BuildSettingsTab(Window, cfg.SettingsTabName)
+        Window._BuildingSettings = false
     end
 
     table.insert(Library.Windows, Window)
     task.defer(function() Window:SetOpen(cfg.AutoShow ~= false) end)
+    -- runs once your script has finished building the UI
+    if cfg.AutoLoadConfig ~= false then
+        task.defer(function() if not Library.AutoloadDone then Library:LoadAutoloadConfig() end end)
+    end
     return Window
 end
 
@@ -1408,6 +1444,358 @@ function Library:SetThemeColor(key, color)
 end
 
 function Library:SetAccent(color) self:SetThemeColor("Accent", color) end
+
+---------------------------------------------------------------------
+-- Config system (JSON files + readable export)
+---------------------------------------------------------------------
+local MemoryStore = {}   -- fallback when the environment has no file functions (e.g. Studio)
+
+local function HasFS()
+    return typeof(writefile) == "function" and typeof(readfile) == "function" and typeof(isfile) == "function"
+end
+
+local function EnsureFolder(path)
+    if typeof(makefolder) ~= "function" or typeof(isfolder) ~= "function" then return end
+    local built = ""
+    for part in path:gmatch("[^/]+") do
+        built = built == "" and part or (built .. "/" .. part)
+        if not isfolder(built) then pcall(makefolder, built) end
+    end
+end
+
+local function ConfigPath(name) return Library.ConfigFolder .. "/" .. name .. ".json" end
+local function AutoloadPath() return Library.ConfigFolder .. "/autoload.txt" end
+
+local function CleanName(name)
+    name = tostring(name or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if name == "" then return nil, "enter a config name" end
+    if name:find("[^%w%s%-_%.]") then return nil, "config names can only use letters, numbers, spaces, - _ ." end
+    return name
+end
+
+local function KeyPretty(key)
+    if not key or key == "None" then return "none" end
+    return (key:gsub("(%l)(%u)", "%1 %2"):lower())
+end
+
+local function PrettyValue(obj)
+    local t = obj.Type
+    if t == "Toggle" then return obj.Value and "True" or "False"
+    elseif t == "Slider" then return tostring(obj.Value)
+    elseif t == "Input" then return '"' .. obj.Value .. '"'
+    elseif t == "Keybind" then return KeyPretty(obj.Value)
+    elseif t == "ColorPicker" then return "#" .. obj.Value:ToHex():upper()
+    elseif t == "Dropdown" then
+        if obj.Multi then
+            local parts = {}
+            for _, v in ipairs(obj.Values) do
+                if obj.Value[v] then table.insert(parts, '"' .. tostring(v) .. '"') end
+            end
+            return "[" .. table.concat(parts, ", ") .. "]"
+        end
+        return obj.Value ~= nil and ('"' .. tostring(obj.Value) .. '"') or "none"
+    end
+    return nil
+end
+
+function Library:SetFolder(folder) self.ConfigFolder = folder end
+
+function Library:SetIgnoreFlags(list)
+    for _, f in ipairs(list) do self.IgnoreFlags[f] = true end
+end
+
+-- table of every saveable flag -> JSON-safe value
+function Library:GetConfigTable()
+    local flags = {}
+    for _, obj in ipairs(self.Ordered) do
+        local f = obj.Flag
+        if f and not self.IgnoreFlags[f] then
+            local t = obj.Type
+            if t == "Toggle" or t == "Slider" or t == "Input" then
+                flags[f] = obj.Value
+            elseif t == "Dropdown" then
+                if obj.Multi then
+                    local arr = {}
+                    for _, v in ipairs(obj.Values) do if obj.Value[v] then table.insert(arr, v) end end
+                    flags[f] = arr
+                else
+                    flags[f] = obj.Value
+                end
+            elseif t == "Keybind" then
+                flags[f] = { key = obj.Value, mode = obj.Mode }
+            elseif t == "ColorPicker" then
+                flags[f] = "#" .. obj.Value:ToHex():upper()
+            end
+        end
+    end
+    return { title = self.ConfigTitle, flags = flags }
+end
+
+function Library:ApplyConfigTable(data)
+    local flags = type(data) == "table" and (data.flags or data) or {}
+    for _, obj in ipairs(self.Ordered) do
+        local f = obj.Flag
+        local val = f and flags[f]
+        if val ~= nil and not self.IgnoreFlags[f] then
+            local ok, err = pcall(function()
+                local t = obj.Type
+                if t == "Toggle" then obj:SetValue(val == true)
+                elseif t == "Slider" then obj:SetValue(tonumber(val))
+                elseif t == "Input" then obj:SetValue(tostring(val))
+                elseif t == "Dropdown" then obj:SetValue(val)
+                elseif t == "Keybind" then
+                    if type(val) == "table" then obj:SetValue(val.key, val.mode) else obj:SetValue(val) end
+                elseif t == "ColorPicker" then obj:SetValueRGB(Color3.fromHex((tostring(val):gsub("#", ""))))
+                end
+            end)
+            if not ok then warn("[Kraxx] failed to load flag " .. f .. ": " .. tostring(err)) end
+        end
+    end
+end
+
+-- readable summary, e.g.  [fake ping]: True, amount: 80
+function Library:ExportConfigText()
+    local lines = { "-- " .. self.ConfigTitle }
+    local current, lineOf = {}, {}
+    local ordered = {}
+    for _, obj in ipairs(self.Ordered) do
+        if not (obj.Group and obj.Group.IsSettings) then table.insert(ordered, obj) end
+    end
+    for _, obj in ipairs(self.Ordered) do
+        if obj.Group and obj.Group.IsSettings then table.insert(ordered, obj) end
+    end
+    for _, obj in ipairs(ordered) do
+        local g = obj.Group
+        if obj.Type == "Divider" or obj.Type == "Label" then
+            current[g] = nil
+        elseif obj.Flag and not self.IgnoreFlags[obj.Flag] then
+            local value = PrettyValue(obj)
+            if value then
+                local parent = obj.ParentObj
+                local label = obj.Text or (parent and parent.Text) or obj.Flag
+                local idx
+                if parent and lineOf[parent] then
+                    idx = lineOf[parent]
+                    if not obj.Text then label = obj.Type == "Keybind" and "bind" or "color" end
+                elseif obj.Type ~= "Toggle" and not obj.Standalone and not parent then
+                    idx = current[g]
+                end
+                label = tostring(label):lower()
+                if idx then
+                    lines[idx] = lines[idx] .. ", " .. label .. ": " .. value
+                    lineOf[obj] = idx
+                else
+                    table.insert(lines, "[" .. label .. "]: " .. value)
+                    lineOf[obj] = #lines
+                    current[g] = obj.Type == "Toggle" and #lines or nil
+                end
+            end
+        end
+    end
+    return table.concat(lines, "\n")
+end
+
+function Library:SaveConfig(name)
+    local clean, err = CleanName(name)
+    if not clean then return false, err end
+    local ok, json = pcall(HttpService.JSONEncode, HttpService, self:GetConfigTable())
+    if not ok then return false, "failed to encode config" end
+    if HasFS() then
+        EnsureFolder(self.ConfigFolder)
+        local wrote, werr = pcall(writefile, ConfigPath(clean), json)
+        if not wrote then return false, tostring(werr) end
+    else
+        MemoryStore[clean] = json
+    end
+    return true
+end
+
+function Library:LoadConfig(name)
+    local clean, err = CleanName(name)
+    if not clean then return false, err end
+    local json
+    if HasFS() then
+        if not isfile(ConfigPath(clean)) then return false, "config not found" end
+        json = readfile(ConfigPath(clean))
+    else
+        json = MemoryStore[clean]
+    end
+    if not json then return false, "config not found" end
+    local ok, data = pcall(HttpService.JSONDecode, HttpService, json)
+    if not ok or type(data) ~= "table" then return false, "config file is not valid json" end
+    self:ApplyConfigTable(data)
+    return true
+end
+
+function Library:DeleteConfig(name)
+    local clean, err = CleanName(name)
+    if not clean then return false, err end
+    if HasFS() then
+        if typeof(delfile) ~= "function" then return false, "delfile is not available" end
+        if not isfile(ConfigPath(clean)) then return false, "config not found" end
+        delfile(ConfigPath(clean))
+    else
+        MemoryStore[clean] = nil
+    end
+    if self:GetAutoload() == clean then self:SetAutoload(nil) end
+    return true
+end
+
+function Library:ListConfigs()
+    local list = {}
+    if HasFS() and typeof(listfiles) == "function" then
+        EnsureFolder(self.ConfigFolder)
+        local ok, files = pcall(listfiles, self.ConfigFolder)
+        if ok then
+            for _, path in ipairs(files) do
+                local n = path:match("([^/\\]+)%.json$")
+                if n then table.insert(list, n) end
+            end
+        end
+    else
+        for n in pairs(MemoryStore) do
+            if n ~= "__autoload" then table.insert(list, n) end
+        end
+    end
+    table.sort(list)
+    return list
+end
+
+function Library:SetAutoload(name)
+    if HasFS() then
+        EnsureFolder(self.ConfigFolder)
+        pcall(writefile, AutoloadPath(), name or "")
+    else
+        MemoryStore.__autoload = name
+    end
+end
+
+function Library:GetAutoload()
+    local name
+    if HasFS() then
+        if isfile(AutoloadPath()) then name = readfile(AutoloadPath()) end
+    else
+        name = MemoryStore.__autoload
+    end
+    if name and name ~= "" then return name end
+    return nil
+end
+
+function Library:LoadAutoloadConfig()
+    self.AutoloadDone = true
+    local name = self:GetAutoload()
+    if not name then return end
+    local ok, err = self:LoadConfig(name)
+    if ok then self:Notify(("loaded autoload config %q"):format(name), 3)
+    else self:Notify(("autoload failed: %s"):format(err), 4) end
+end
+
+function Library:BuildConfigSection(tab, side)
+    local box = (side == "Left") and tab:AddLeftGroupbox("Configuration") or tab:AddRightGroupbox("Configuration")
+    local list, autoLabel
+
+    local function Refresh()
+        list:SetValues(self:ListConfigs())
+    end
+    local function Selected()
+        if list.Value == nil then self:Notify("select a config first", 2) end
+        return list.Value
+    end
+
+    local nameInput = box:AddInput("Kraxx_ConfigName", { Text = "config name", Placeholder = "my config" })
+    box:AddButton({ Text = "create config", Func = function()
+        local clean, err = CleanName(nameInput.Value)
+        if not clean then return self:Notify(err, 3) end
+        if table.find(self:ListConfigs(), clean) then
+            return self:Notify(("%q already exists, use overwrite"):format(clean), 3)
+        end
+        local ok, serr = self:SaveConfig(clean)
+        if not ok then return self:Notify("save failed: " .. serr, 4) end
+        Refresh()
+        list:SetValue(clean)
+        self:Notify(("created config %q"):format(clean), 3)
+    end })
+    box:AddDivider()
+
+    list = box:AddDropdown("Kraxx_ConfigList", { Text = "config list", Values = self:ListConfigs(), AllowNull = true })
+    box:AddButton({ Text = "load config", Func = function()
+        local name = Selected()
+        if not name then return end
+        local ok, err = self:LoadConfig(name)
+        self:Notify(ok and ("loaded config %q"):format(name) or ("load failed: " .. err), 3)
+    end })
+    box:AddButton({ Text = "overwrite config", DoubleClick = true, Func = function()
+        local name = Selected()
+        if not name then return end
+        local ok, err = self:SaveConfig(name)
+        self:Notify(ok and ("saved config %q"):format(name) or ("save failed: " .. err), 3)
+    end })
+    box:AddButton({ Text = "delete config", DoubleClick = true, Func = function()
+        local name = Selected()
+        if not name then return end
+        local ok, err = self:DeleteConfig(name)
+        if ok then Refresh() end
+        autoLabel:SetText("autoload: " .. (self:GetAutoload() or "none"))
+        self:Notify(ok and ("deleted config %q"):format(name) or ("delete failed: " .. err), 3)
+    end })
+    box:AddButton({ Text = "refresh list", Func = Refresh })
+    box:AddDivider()
+
+    box:AddButton({ Text = "set as autoload", Func = function()
+        local name = Selected()
+        if not name then return end
+        self:SetAutoload(name)
+        autoLabel:SetText("autoload: " .. name)
+        self:Notify(("%q will load automatically"):format(name), 3)
+    end })
+    box:AddButton({ Text = "clear autoload", Func = function()
+        self:SetAutoload(nil)
+        autoLabel:SetText("autoload: none")
+    end })
+    autoLabel = box:AddLabel("autoload: " .. (self:GetAutoload() or "none"))
+    box:AddDivider()
+
+    box:AddButton({ Text = "copy config", Func = function()
+        local text = self:ExportConfigText()
+        if typeof(setclipboard) == "function" then
+            setclipboard(text)
+            self:Notify("config copied to clipboard", 2)
+        else
+            print(text)
+            self:Notify("clipboard unavailable, config printed to output", 3)
+        end
+    end })
+
+    self:SetIgnoreFlags({ "Kraxx_ConfigName", "Kraxx_ConfigList" })
+    return box
+end
+
+-- built into every window automatically (disable with SettingsTab = false)
+function Library:_BuildSettingsTab(window, name)
+    local tab = window:AddTab(name or "Settings")
+    local menu = tab:AddLeftGroupbox("Menu")
+    menu.IsSettings = true
+    menu:AddKeybind("Kraxx_MenuBind", {
+        Text = "menu bind", Default = self.ToggleKey, Mode = "Always",
+        ChangedCallback = function(key) self:SetToggleKey(key) end,
+    })
+    menu:AddColorPicker("Kraxx_Accent", {
+        Text = "accent color", Default = Theme.Accent, Callback = function(c) self:SetAccent(c) end,
+    })
+    menu:AddSlider("Kraxx_DragSmoothness", {
+        Text = "drag smoothness", Min = 5, Max = 40, Default = self.DragSmoothness, ShowMax = false, Standalone = true,
+        Callback = function(v) self.DragSmoothness = v end,
+    })
+    menu:AddToggle("Kraxx_Watermark", {
+        Text = "watermark", Default = true, Callback = function(v) self:SetWatermarkVisibility(v) end,
+    })
+    menu:AddDivider()
+    menu:AddButton({ Text = "unload", DoubleClick = true, Func = function() self:Unload() end })
+
+    self:BuildConfigSection(tab, "Right").IsSettings = true
+    window.Settings = { Tab = tab, Menu = menu }
+    return tab
+end
 
 function Library:OnUnload(fn) table.insert(self.UnloadCallbacks, fn) end
 
