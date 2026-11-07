@@ -30,6 +30,7 @@ local Library = {
         Element    = Color3.fromRGB(30, 30, 33),   -- boxes, bars, buttons
         Hover      = Color3.fromRGB(40, 40, 44),
         Outline    = Color3.fromRGB(44, 44, 48),   -- inner borders
+        Highlight  = Color3.fromRGB(70, 70, 76),   -- resize grip / subtle marks
         Border     = Color3.fromRGB(6, 6, 7),      -- outer / element borders
         Accent     = Color3.fromRGB(86, 156, 255),
         Text       = Color3.fromRGB(226, 226, 230),
@@ -1172,6 +1173,9 @@ function Library:CreateWindow(cfg)
     local size = cfg.Size or UDim2.fromOffset(560, 600)
     local start = cfg.Position and Vector2.new(cfg.Position.X.Offset, cfg.Position.Y.Offset) or (Viewport() / 2)
     local Window = { Tabs = {}, Open = false, ActiveTab = nil, Current = start, Target = start, FirstOpen = true }
+    local startSize = Vector2.new(size.X.Offset, size.Y.Offset)
+    Window.CurSize, Window.TargetSize = startSize, startSize
+    Window.MinSize = cfg.MinSize or Vector2.new(420, 320)
 
     local Holder = New("Frame", {
         Name = "Window", BackgroundColor3 = Theme.Main, AnchorPoint = Vector2.new(0.5, 0.5),
@@ -1219,17 +1223,71 @@ function Library:CreateWindow(cfg)
         end)
     end)
 
+    -- smooth drag + smooth resize (top-left corner stays put while resizing)
     function Window:_Step(dt)
-        local diff = self.Target - self.Current
-        if diff.Magnitude < 0.1 then
-            if self.Current ~= self.Target then
-                self.Current = self.Target
-                Holder.Position = UDim2.fromOffset(math.floor(self.Target.X + 0.5), math.floor(self.Target.Y + 0.5))
-            end
-            return
+        local alpha = 1 - math.exp(-dt * Library.DragSmoothness)
+        local dirty = false
+        if self.CurSize ~= self.TargetSize then
+            local new = (self.TargetSize - self.CurSize).Magnitude < 0.5 and self.TargetSize
+                or self.CurSize:Lerp(self.TargetSize, alpha)
+            local delta = new - self.CurSize
+            self.CurSize = new
+            self.Current += delta / 2
+            self.Target += delta / 2
+            Holder.Size = UDim2.fromOffset(math.floor(new.X / 2 + 0.5) * 2, math.floor(new.Y / 2 + 0.5) * 2)
+            dirty = true
         end
-        self.Current = self.Current:Lerp(self.Target, 1 - math.exp(-dt * Library.DragSmoothness))
-        Holder.Position = UDim2.fromOffset(math.floor(self.Current.X + 0.5), math.floor(self.Current.Y + 0.5))
+        if self.Current ~= self.Target then
+            self.Current = (self.Target - self.Current).Magnitude < 0.1 and self.Target
+                or self.Current:Lerp(self.Target, alpha)
+            dirty = true
+        end
+        if dirty then
+            Holder.Position = UDim2.fromOffset(math.floor(self.Current.X + 0.5), math.floor(self.Current.Y + 0.5))
+        end
+    end
+
+    function Window:SetSize(v)
+        local vp = Viewport()
+        self.TargetSize = Vector2.new(
+            math.clamp(v.X, self.MinSize.X, math.max(self.MinSize.X, vp.X)),
+            math.clamp(v.Y, self.MinSize.Y, math.max(self.MinSize.Y, vp.Y))
+        )
+    end
+
+    -- resize grip (bottom-right)
+    if cfg.Resizable ~= false then
+        local Grip = New("TextButton", {
+            Text = "", AutoButtonColor = false, BackgroundTransparency = 1, AnchorPoint = Vector2.new(1, 1),
+            Position = UDim2.new(1, -1, 1, -1), Size = UDim2.fromOffset(14, 14), ZIndex = 12, Parent = Holder,
+        })
+        local dots = {}
+        for _, d in ipairs({ { 8, 0 }, { 4, 4 }, { 8, 4 }, { 0, 8 }, { 4, 8 }, { 8, 8 } }) do
+            table.insert(dots, New("Frame", {
+                BackgroundColor3 = Theme.Highlight, Position = UDim2.fromOffset(d[1] + 2, d[2] + 2),
+                Size = UDim2.fromOffset(2, 2), ZIndex = 13, Parent = Grip,
+            }))
+        end
+        local resizing, hovering = false, false
+        local function Paint()
+            local col = (resizing or hovering) and Theme.Accent or Theme.Highlight
+            for _, dot in ipairs(dots) do Tween(dot, { BackgroundColor3 = col }, 0.12) end
+        end
+        Grip.MouseEnter:Connect(function() hovering = true; Paint() end)
+        Grip.MouseLeave:Connect(function() hovering = false; Paint() end)
+        Grip.InputBegan:Connect(function(input)
+            if not IsClick(input) then return end
+            resizing = true
+            Paint()
+            Library:ClosePopup()
+            local startMouse, origin = MousePos(), Window.TargetSize
+            BeginDrag(function(m)
+                Window:SetSize(origin + (m - startMouse))
+            end, function()
+                resizing = false
+                Paint()
+            end)
+        end)
     end
 
     function Window:SetOpen(state)
